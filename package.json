@@ -67,6 +67,7 @@
     "test": "echo \"No tests\"",
     "test:e2e": "playwright test",
     "test:sync": "playwright test --config=playwright.sync.config.ts",
+    "test:e2e:mainline": "playwright test -c playwright.mainline.config.ts",
     "lint": "eslint .",
     "prettier": "prettier --write .",
     "prepare": "husky install"
@@ -90,7 +91,7 @@
   },
   "devDependencies": {
     "@iconify/json": "^2.2.242",
-    "@playwright/test": "^1.40.1",
+    "@playwright/test": "^1.65.1",
     "@svgr/core": "^7.0.0",
     "@svgr/plugin-jsx": "^7.0.0",
     "@tailwindcss/forms": "^0.5.3",
