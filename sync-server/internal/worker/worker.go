@@ -31,7 +31,7 @@ func (w *Worker) Start(ctx context.Context) error {
 		Durable:       "sync-worker",
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		AckWait:       30 * time.Second,
-		MaxDeliver:    5,
+		MaxDeliver:    -1,
 		FilterSubject: "sync.up.*",
 	})
 	if err != nil {
@@ -84,7 +84,7 @@ func (w *Worker) handleUpMessage(msg jetstream.Msg) {
 		_ = msg.NakWithDelay(time.Second)
 		return
 	}
-	if res.Duplicate {
+	if res.Duplicate && !res.Pending {
 		_ = msg.Ack()
 		return
 	}
@@ -102,6 +102,10 @@ func (w *Worker) handleUpMessage(msg jetstream.Msg) {
 		return
 	}
 
+	if err := w.store.MarkBroadcast(ctx, res.Event.EventID); err != nil {
+		_ = msg.NakWithDelay(time.Second)
+		return
+	}
 	_ = msg.Ack()
 	log.Printf("[worker] synced user=%s entity=%s op=%s seq=%d from=%s",
 		res.Event.UserID, res.Event.Entity, res.Event.Op, res.Event.ServerSeq, res.Event.SourceDeviceID)
@@ -116,12 +120,16 @@ func (w *Worker) handleSnapshotRequest(msg *nats.Msg) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	snap, err := w.store.GetSnapshot(ctx, req.UserID, req.AfterSeq)
+	snap, err := w.store.GetSnapshot(ctx, req.UserID, req.AfterSeq, req.AfterRow)
 	if err != nil {
 		log.Printf("[worker] query snapshot failed: %v", err)
 		return
 	}
-	if out, err := json.Marshal(snap); err == nil {
-		_ = msg.Respond(out)
+	out, err := json.Marshal(snap)
+	if err == nil {
+		err = msg.Respond(out)
+	}
+	if err != nil {
+		log.Printf("[worker] reply to snapshot failed: %v", err)
 	}
 }

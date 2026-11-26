@@ -100,13 +100,14 @@ const App: React.FC = () => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (!isLoading && e.key !== 'Enter' && (isLegal(e.key) || e.key === ' ') && !e.altKey && !e.ctrlKey && !e.metaKey) {
         e.preventDefault()
-        dispatch({ type: TypingStateActionType.SET_IS_TYPING, payload: true })
+        if (resumePractice?.matchesCurrent) resumePractice.start(true)
+        else dispatch({ type: TypingStateActionType.SET_IS_TYPING, payload: true })
       }
     }
     window.addEventListener('keydown', onKeyDown)
 
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [state.isTyping, state.isFinished, isLoading, dispatch])
+  }, [state.isTyping, state.isFinished, isLoading, dispatch, resumePractice])
 
   useEffect(() => {
     if (words !== undefined) {
@@ -152,9 +153,9 @@ const App: React.FC = () => {
           <DictChapterButton />
           <PronunciationSwitcher />
           <Switcher />
-          <StartButton isLoading={isLoading} />
+          <StartButton isLoading={isLoading} onResume={resumePractice?.matchesCurrent ? () => resumePractice.start(true) : undefined} />
           {resumePractice && !state.isTyping && (
-            <button type="button" className="my-btn-primary" onClick={resumePractice}>
+            <button type="button" className="my-btn-primary" onClick={() => resumePractice.start()}>
               继续上次练习
             </button>
           )}

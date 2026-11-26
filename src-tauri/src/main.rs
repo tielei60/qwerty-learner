@@ -41,7 +41,7 @@ fn find_sync_server_binary() -> Option<PathBuf> {
 
 /// Ensure the shared sync-server daemon is running on the local machine.
 /// Left running as a detached background process when Tauri exits so the web client stays synced.
-fn ensure_sync_server_running(port: u16) {
+fn ensure_sync_server_running(port: u16, data_dir: Option<PathBuf>) {
   if is_sync_port_open(port) {
     return;
   }
@@ -50,6 +50,9 @@ fn ensure_sync_server_running(port: u16) {
     let mut cmd = Command::new(&bin);
     if let Some(parent) = bin.parent() {
       cmd.current_dir(parent);
+    }
+    if let Some(data_dir) = data_dir {
+      if std::env::var_os("SYNC_DATA_DIR").is_none() { cmd.env("SYNC_DATA_DIR", data_dir); }
     }
     let _ = cmd
       .env("SYNC_WS_PORT", port.to_string())
@@ -66,9 +69,11 @@ fn main() {
     .and_then(|v| v.parse().ok())
     .unwrap_or(9322);
 
-  ensure_sync_server_running(ws_port);
-
   tauri::Builder::default()
+    .setup(move |app| {
+      ensure_sync_server_running(ws_port, app.path_resolver().app_data_dir());
+      Ok(())
+    })
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }

@@ -22,9 +22,19 @@ port_open() {
   fi
 }
 
-pid_alive() {
-  local pid_file="$1"
-  [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" >/dev/null 2>&1
+stop_managed() {
+  local pid_file="$1" executable="$2" pid command
+  [ -f "$pid_file" ] || return 0
+  pid="$(cat "$pid_file")"
+  case "$pid" in ''|*[!0-9]*|0|1) return 1 ;; esac
+  command="$(ps -p "$pid" -o command= || true)"
+  if [ -n "$command" ]; then
+    case "$command" in
+      "$executable"|"$executable "*|*"node $executable preview "*) kill "$pid" ;;
+      *) echo "PID $pid does not belong to this service" >&2; return 1 ;;
+    esac
+  fi
+  rm -f "$pid_file"
 }
 
 start_sync() {
@@ -49,18 +59,7 @@ start_sync() {
 }
 
 stop_sync() {
-  local pid_file="$RUN_DIR/sync-server.pid"
-  if pid_alive "$pid_file"; then
-    kill "$(cat "$pid_file")" >/dev/null 2>&1 || true
-    rm -f "$pid_file"
-    echo "[sync-server] 已停止"
-  else
-    local pids
-    pids="$(lsof -iTCP:"$SYNC_WS_PORT" -sTCP:LISTEN -t 2>/dev/null || true)"
-    [ -n "$pids" ] && kill $pids >/dev/null 2>&1 || true
-    rm -f "$pid_file"
-    echo "[sync-server] 已停止"
-  fi
+  stop_managed "$RUN_DIR/sync-server.pid" "$SYNC_BIN"
 }
 
 start_web() {
@@ -75,7 +74,7 @@ start_web() {
   echo "[web] 启动常驻网页端 (http://127.0.0.1:$WEB_PORT)..."
   (
     cd "$ROOT_DIR"
-    nohup yarn vite preview --host 127.0.0.1 --port "$WEB_PORT" --strictPort \
+    nohup node "$ROOT_DIR/node_modules/vite/bin/vite.js" preview --host 127.0.0.1 --port "$WEB_PORT" --strictPort \
       >>"$RUN_DIR/web.log" 2>&1 < /dev/null &
     echo $! > "$RUN_DIR/web.pid"
   )
@@ -86,18 +85,7 @@ start_web() {
 }
 
 stop_web() {
-  local pid_file="$RUN_DIR/web.pid"
-  if pid_alive "$pid_file"; then
-    kill "$(cat "$pid_file")" >/dev/null 2>&1 || true
-    rm -f "$pid_file"
-    echo "[web] 已停止"
-  else
-    local pids
-    pids="$(lsof -iTCP:"$WEB_PORT" -sTCP:LISTEN -t 2>/dev/null || true)"
-    [ -n "$pids" ] && kill $pids >/dev/null 2>&1 || true
-    rm -f "$pid_file"
-    echo "[web] 已停止"
-  fi
+  stop_managed "$RUN_DIR/web.pid" "$ROOT_DIR/node_modules/vite/bin/vite.js"
 }
 
 start_desktop() {

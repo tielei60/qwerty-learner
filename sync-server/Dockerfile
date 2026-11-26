@@ -14,11 +14,10 @@ RUN apk add --no-cache ca-certificates
 COPY --from=builder /sync-server /usr/local/bin/sync-server
 
 ENV SYNC_DATA_DIR=/data
-ENV SYNC_NATS_HOST=0.0.0.0
-ENV SYNC_WS_HOST=0.0.0.0
+ENV SYNC_NATS_HOST=127.0.0.1
+ENV SYNC_WS_HOST=127.0.0.1
 ENV SYNC_WS_PORT=9322
 
 VOLUME ["/data"]
-EXPOSE 4222 9322
 
 ENTRYPOINT ["/usr/local/bin/sync-server"]

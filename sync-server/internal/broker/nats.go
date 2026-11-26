@@ -3,6 +3,8 @@ package broker
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"time"
 
@@ -19,12 +21,22 @@ const (
 )
 
 type EmbeddedBroker struct {
-	ns *server.Server
-	nc *nats.Conn
-	js jetstream.JetStream
+	ns       *server.Server
+	nc       *nats.Conn
+	js       jetstream.JetStream
+	wsServer *http.Server
 }
 
 func Start(ctx context.Context, cfg config.Config) (*EmbeddedBroker, error) {
+	for _, host := range []string{cfg.NATSHost, cfg.WSHost} {
+		if host == "" && cfg.WSPort == 0 {
+			continue
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return nil, fmt.Errorf("sync listeners must bind to a loopback IP: %q", host)
+		}
+	}
 	if err := os.MkdirAll(cfg.NATSStoreDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create nats store dir: %w", err)
 	}
@@ -37,10 +49,16 @@ func Start(ctx context.Context, cfg config.Config) (*EmbeddedBroker, error) {
 		StoreDir:      cfg.NATSStoreDir,
 		Authorization: cfg.AuthToken,
 		Websocket: server.WebsocketOpts{
-			Host:  cfg.WSHost,
-			Port:  cfg.WSPort,
-			NoTLS: true,
+			Host:           cfg.WSHost,
+			Port:           cfg.WSPort,
+			NoTLS:          true,
+			AllowedOrigins: []string{proxyOrigin},
 		},
+	}
+	if cfg.WSPort != 0 {
+		// NATS only supports HTTP origins. A local proxy also checks Tauri's
+		// tauri://localhost origin before forwarding to this private listener.
+		opts.Websocket.Port = -1
 	}
 
 	ns, err := server.NewServer(opts)
@@ -93,14 +111,25 @@ func Start(ctx context.Context, cfg config.Config) (*EmbeddedBroker, error) {
 		}
 	}
 
-	return &EmbeddedBroker{ns: ns, nc: nc, js: js}, nil
+	b := &EmbeddedBroker{ns: ns, nc: nc, js: js}
+	if cfg.WSPort != 0 {
+		b.wsServer, err = startWebsocketProxy(cfg, ns.WebsocketURL())
+		if err != nil {
+			b.Close()
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
-func (b *EmbeddedBroker) Conn() *nats.Conn             { return b.nc }
+func (b *EmbeddedBroker) Conn() *nats.Conn               { return b.nc }
 func (b *EmbeddedBroker) JetStream() jetstream.JetStream { return b.js }
-func (b *EmbeddedBroker) ClientURL() string            { return b.ns.ClientURL() }
+func (b *EmbeddedBroker) ClientURL() string              { return b.ns.ClientURL() }
 
 func (b *EmbeddedBroker) Close() {
+	if b.wsServer != nil {
+		_ = b.wsServer.Close()
+	}
 	if b.nc != nil {
 		_ = b.nc.Drain()
 	}

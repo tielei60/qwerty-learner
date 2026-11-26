@@ -76,6 +76,11 @@ CREATE TABLE IF NOT EXISTS sync_events (
 CREATE INDEX IF NOT EXISTS idx_sync_events_user_seq
 	ON sync_events (user_id, server_seq);
 
+CREATE TABLE IF NOT EXISTS sync_pending_broadcast (
+ event_id TEXT PRIMARY KEY,
+ event TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS shared_records (
 	user_id    TEXT NOT NULL,
 	entity     TEXT NOT NULL,
@@ -99,6 +104,7 @@ CREATE INDEX IF NOT EXISTS idx_shared_records_user_entity
 // ApplyResult indicates whether an event was newly applied or deduplicated.
 type ApplyResult struct {
 	Duplicate bool
+	Pending   bool
 	Event     protocol.SyncEvent
 }
 
@@ -116,7 +122,18 @@ func (s *Store) ApplyEvent(ctx context.Context, ev protocol.SyncEvent) (ApplyRes
 	err = tx.QueryRowContext(ctx, `SELECT server_seq FROM sync_events WHERE event_id = ?`, ev.EventID).Scan(&existingSeq)
 	if err == nil {
 		ev.ServerSeq = existingSeq
-		return ApplyResult{Duplicate: true, Event: ev}, nil
+		var pending string
+		err := tx.QueryRowContext(ctx, "SELECT event FROM sync_pending_broadcast WHERE event_id = ?", ev.EventID).Scan(&pending)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ApplyResult{Duplicate: true, Event: ev}, nil
+		}
+		if err != nil {
+			return ApplyResult{}, err
+		}
+		if err := json.Unmarshal([]byte(pending), &ev); err != nil {
+			return ApplyResult{}, err
+		}
+		return ApplyResult{Duplicate: true, Pending: true, Event: ev}, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return ApplyResult{}, fmt.Errorf("check duplicate event: %w", err)
@@ -146,10 +163,23 @@ func (s *Store) ApplyEvent(ctx context.Context, ev protocol.SyncEvent) (ApplyRes
 		return ApplyResult{}, err
 	}
 
+	wire, err := json.Marshal(ev)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO sync_pending_broadcast(event_id,event) VALUES (?,?)", ev.EventID, string(wire)); err != nil {
+		return ApplyResult{}, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return ApplyResult{}, fmt.Errorf("commit tx: %w", err)
 	}
 	return ApplyResult{Duplicate: false, Event: ev}, nil
+}
+
+func (s *Store) MarkBroadcast(ctx context.Context, eventID string) error {
+	_, err := s.db.ExecContext(ctx, "DELETE FROM sync_pending_broadcast WHERE event_id = ?", eventID)
+	return err
 }
 
 func applyToSharedRecords(ctx context.Context, tx *sql.Tx, ev *protocol.SyncEvent) error {
@@ -225,9 +255,10 @@ func upsertRecord(ctx context.Context, tx *sql.Tx, ev *protocol.SyncEvent) error
 			mergedUpdatedAt = existingUpdatedAt
 		}
 	case protocol.EntityConfig:
-		// LWW per config key: ignore older updates.
-		if ev.ClientTs < existingUpdatedAt {
-			return nil
+		if ev.ClientTs < existingUpdatedAt || (ev.SyncUID == "unfinishedPractice" && practiceRegresses(existingPayload, mergedPayload)) {
+			mergedPayload = existingPayload
+			mergedUpdatedAt = existingUpdatedAt
+			ev.Payload = json.RawMessage(existingPayload)
 		}
 	default:
 		// Append-only entities (wordRecords / chapterRecords): keep latest payload if updated.
@@ -242,6 +273,30 @@ func upsertRecord(ctx context.Context, tx *sql.Tx, ev *protocol.SyncEvent) error
 		WHERE user_id = ? AND entity = ? AND sync_uid = ?
 	`, mergedPayload, mergedUpdatedAt, ev.ServerSeq, ev.UserID, ev.Entity, ev.SyncUID)
 	return err
+}
+
+func practiceRegresses(current, incoming string) bool {
+	type checkpoint struct {
+		Dict     string
+		Chapter  int
+		Progress *struct {
+			ChapterData struct{ Index int }
+		}
+	}
+	decode := func(payload string) (checkpoint, error) {
+		var config struct{ Value string }
+		var cp checkpoint
+		if err := json.Unmarshal([]byte(payload), &config); err != nil {
+			return cp, err
+		}
+		err := json.Unmarshal([]byte(config.Value), &cp)
+		return cp, err
+	}
+	old, oldErr := decode(current)
+	next, nextErr := decode(incoming)
+	return oldErr == nil && nextErr == nil && old.Progress != nil && next.Progress != nil &&
+		old.Dict == next.Dict && old.Chapter == next.Chapter &&
+		old.Progress.ChapterData.Index > next.Progress.ChapterData.Index
 }
 
 func mergeReviewPayload(oldJSON, newJSON string) (string, error) {
@@ -270,9 +325,9 @@ func mergeReviewPayload(oldJSON, newJSON string) (string, error) {
 	return string(out), nil
 }
 
-// GetSnapshot returns active authoritative records for a user (optionally filtered by afterSeq)
+// GetSnapshot returns authoritative records and deletion markers for a user (optionally filtered by afterSeq)
 // along with the user's latest server_seq.
-func (s *Store) GetSnapshot(ctx context.Context, userID string, afterSeq int64) (protocol.SnapshotResponse, error) {
+func (s *Store) GetSnapshot(ctx context.Context, userID string, afterSeq, afterRow int64) (protocol.SnapshotResponse, error) {
 	resp := protocol.SnapshotResponse{
 		UserID:  userID,
 		Records: make([]protocol.SnapshotRecord, 0),
@@ -287,23 +342,41 @@ func (s *Store) GetSnapshot(ctx context.Context, userID string, afterSeq int64) 
 	}
 
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT entity, sync_uid, payload, updated_at, server_seq
+		SELECT entity, sync_uid, payload, updated_at, server_seq, deleted, rowid
 		FROM shared_records
-		WHERE user_id = ? AND deleted = 0 AND server_seq > ?
-		ORDER BY server_seq ASC
-	`, userID, afterSeq)
+		WHERE user_id = ? AND server_seq <= ? AND (
+		  (server_seq, rowid) > (?, ?) OR (? = 0 AND entity = 'config' AND sync_uid = 'unfinishedPractice')
+		)
+		ORDER BY (server_seq <= ?) DESC, server_seq ASC, rowid ASC
+	`, userID, resp.LatestServerSeq, afterSeq, afterRow, afterRow, afterSeq)
 	if err != nil {
 		return resp, err
 	}
 	defer rows.Close()
 
+	remaining := 768 * 1024
+	var cursor, cursorRow int64
 	for rows.Next() {
 		var rec protocol.SnapshotRecord
 		var payloadStr string
-		if err := rows.Scan(&rec.Entity, &rec.SyncUID, &payloadStr, &rec.UpdatedAt, &rec.ServerSeq); err != nil {
+		var rowID int64
+		if err := rows.Scan(&rec.Entity, &rec.SyncUID, &payloadStr, &rec.UpdatedAt, &rec.ServerSeq, &rec.Deleted, &rowID); err != nil {
 			return resp, err
 		}
 		rec.Payload = json.RawMessage(payloadStr)
+		encoded, err := json.Marshal(rec)
+		if err != nil {
+			return resp, err
+		}
+		if len(encoded)+1 > remaining && cursorRow != 0 {
+			resp.NextAfterSeq = cursor
+			resp.NextAfterRow = cursorRow
+			return resp, nil
+		}
+		remaining -= len(encoded) + 1
+		if rec.ServerSeq > afterSeq || (afterRow != 0 && rec.ServerSeq == afterSeq) {
+			cursor, cursorRow = rec.ServerSeq, rowID
+		}
 		resp.Records = append(resp.Records, rec)
 	}
 	return resp, rows.Err()

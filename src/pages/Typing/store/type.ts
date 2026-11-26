@@ -44,6 +44,7 @@ export type WrongWordData = {
 export type TypingState = {
   practiceKey?: string
   practiceRestoreVersion?: number
+  practiceRestartVersion?: number
   chapterData: ChapterData
   timerData: TimerData
   isTyping: boolean

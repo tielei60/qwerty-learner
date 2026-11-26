@@ -187,6 +187,8 @@ export const typingReducer = (state: TypingState, action: TypingStateAction) => 
     case TypingStateActionType.REPEAT_CHAPTER: {
       const newState = structuredClone(initialState)
       newState.practiceKey = state.practiceKey
+      newState.practiceRestartVersion = (state.practiceRestartVersion ?? 0) + 1
+      newState.practiceRestoreVersion = (state.practiceRestoreVersion ?? 0) + 1
       newState.chapterData.userInputLogs = state.chapterData.words.map((_, index) => ({ ...structuredClone(initialUserInputLog), index }))
       newState.isTyping = true
       newState.chapterData.words = action.shouldShuffle ? shuffle(state.chapterData.words) : state.chapterData.words

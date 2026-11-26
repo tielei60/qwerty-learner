@@ -2,15 +2,15 @@ import {
   bindIdMapping,
   enqueueOutbox,
   generateEventId,
-  generateSyncUid,
   getLocalIdBySyncUid,
   getOrCreateDeviceId,
+  getOrCreateRecordSyncUid,
   getSyncUidByLocalId,
-  setLastServerSeq,
 } from './metaDb'
 import type { SnapshotResponse, SyncEntity, SyncEvent } from './types'
 import { db } from '@/utils/db'
 import type { IChapterRecord, IReviewRecord, IWordRecord } from '@/utils/db/record'
+import Dexie from 'dexie'
 import type { Table } from 'dexie'
 
 /**
@@ -39,16 +39,17 @@ export const SYNCED_STORAGE_KEYS = [
 
 const SYNCED_KEY_SET = new Set<string>(SYNCED_STORAGE_KEYS)
 
-let isApplyingRemote = false
+const remoteTransactions = new WeakSet<object>()
 let hooksRegistered = false
+let setRemoteStorageItem: typeof Storage.prototype.setItem | undefined
 
-async function withRemoteGuard<T>(fn: () => Promise<T>): Promise<T> {
-  isApplyingRemote = true
-  try {
-    return await fn()
-  } finally {
-    isApplyingRemote = false
-  }
+function remoteWrite<T>(entity: Exclude<SyncEntity, 'config'>, write: () => PromiseLike<T>): Promise<T> {
+  return db.transaction('rw!', db[entity], async () => {
+    const transaction = Dexie.currentTransaction
+    if (!transaction) throw new Error('Missing remote write transaction')
+    remoteTransactions.add(transaction)
+    return await write()
+  })
 }
 
 export interface HookCallbacks {
@@ -74,7 +75,7 @@ function attachTableHooks(entity: Exclude<SyncEntity, 'config'>, cb: HookCallbac
   const table = db[entity] as unknown as Table<Record<string, unknown>, number>
 
   table.hook('creating', function (_primKey, obj, trans) {
-    if (isApplyingRemote) return
+    if (remoteTransactions.has(trans)) return
     const snapshot = clonePlain(obj)
 
     // Bind post-commit callback so rolled-back transactions never leak dirty events
@@ -87,7 +88,7 @@ function attachTableHooks(entity: Exclude<SyncEntity, 'config'>, cb: HookCallbac
   })
 
   table.hook('updating', function (modifications, primKey, obj, trans) {
-    if (isApplyingRemote) return
+    if (remoteTransactions.has(trans)) return
     const localId = Number(primKey)
     const merged = { ...clonePlain(obj), ...clonePlain(modifications) }
     trans.on('complete', () => {
@@ -96,7 +97,7 @@ function attachTableHooks(entity: Exclude<SyncEntity, 'config'>, cb: HookCallbac
   })
 
   table.hook('deleting', function (primKey, obj, trans) {
-    if (isApplyingRemote) return
+    if (remoteTransactions.has(trans)) return
     const localId = Number(primKey)
     const snapshot = clonePlain(obj)
     trans.on('complete', () => {
@@ -115,11 +116,7 @@ async function emitCreateEvent(
   if (!userId) return
 
   const deviceId = await getOrCreateDeviceId()
-  let syncUid = await getSyncUidByLocalId(entity, localId)
-  if (!syncUid) {
-    syncUid = generateSyncUid(deviceId)
-    await bindIdMapping(entity, localId, syncUid)
-  }
+  const syncUid = await getOrCreateRecordSyncUid(entity, localId)
 
   const payload = { ...rawPayload }
   delete payload.id
@@ -159,11 +156,7 @@ async function emitUpdateEvent(
   if (!userId) return
 
   const deviceId = await getOrCreateDeviceId()
-  let syncUid = await getSyncUidByLocalId(entity, localId)
-  if (!syncUid) {
-    syncUid = generateSyncUid(deviceId)
-    await bindIdMapping(entity, localId, syncUid)
-  }
+  const syncUid = await getOrCreateRecordSyncUid(entity, localId)
 
   const payload = { ...rawPayload }
   delete payload.id
@@ -213,12 +206,13 @@ function attachLocalStorageHook(cb: HookCallbacks): void {
   if (typeof window === 'undefined' || !window.localStorage) return
   const proto = Storage.prototype
   const originalSetItem = proto.setItem
+  setRemoteStorageItem = originalSetItem
 
   proto.setItem = function patchedSetItem(key: string, value: string): void {
     const prev = this === window.localStorage ? this.getItem(key) : null
     originalSetItem.call(this, key, value)
 
-    if (this !== window.localStorage || isApplyingRemote || !SYNCED_KEY_SET.has(key) || prev === value) {
+    if (this !== window.localStorage || !SYNCED_KEY_SET.has(key) || prev === value) {
       return
     }
     void emitConfigUpdate(key, value, cb)
@@ -229,7 +223,9 @@ async function emitConfigUpdate(key: string, value: string, cb: HookCallbacks): 
   const userId = cb.getUserId()
   if (!userId) return
 
+  const clientTs = Date.now()
   const deviceId = await getOrCreateDeviceId()
+  const portableValue = await serializeConfigValue(key, value)
   const event: SyncEvent = {
     eventId: generateEventId(deviceId),
     userId,
@@ -237,11 +233,28 @@ async function emitConfigUpdate(key: string, value: string, cb: HookCallbacks): 
     entity: 'config',
     op: 'UPDATE',
     syncUid: key,
-    payload: { key, value },
-    clientTs: Date.now(),
+    payload: { key, value: portableValue },
+    clientTs,
   }
   await enqueueOutbox(event)
   cb.onOutboxQueued()
+}
+
+type ReviewModeConfig = {
+  isReviewMode: boolean
+  reviewRecord?: IReviewRecord
+  reviewSyncUid?: string
+}
+
+/** Replace device-local review IDs in both live updates and historical settings. */
+export async function serializeConfigValue(key: string, value: string): Promise<string> {
+  if (key !== 'reviewModeInfo') return value
+  const info = JSON.parse(value) as ReviewModeConfig
+  if (!info.reviewRecord) return value
+  const { id, ...record } = info.reviewRecord
+  if (typeof id === 'number') info.reviewSyncUid = await getOrCreateRecordSyncUid('reviewRecords', id)
+  info.reviewRecord = record
+  return JSON.stringify(info)
 }
 
 /**
@@ -250,14 +263,13 @@ async function emitConfigUpdate(key: string, value: string, cb: HookCallbacks): 
  */
 export async function applyRemoteEvent(ev: SyncEvent): Promise<void> {
   const selfDeviceId = await getOrCreateDeviceId()
-  if (ev.sourceDeviceId === selfDeviceId) {
-    if (ev.serverSeq) await setLastServerSeq(ev.serverSeq)
+  if (ev.sourceDeviceId === selfDeviceId && ev.entity !== 'config') {
     return
   }
 
-  await withRemoteGuard(async () => {
+  await (async () => {
     if (ev.entity === 'config') {
-      applyRemoteConfig(ev.syncUid, ev.payload)
+      await applyRemoteConfig(ev.syncUid, ev.payload)
       return
     }
 
@@ -265,45 +277,45 @@ export async function applyRemoteEvent(ev: SyncEvent): Promise<void> {
       const word = String(ev.payload.word ?? '')
       const dict = String(ev.payload.dict ?? '')
       if (word && dict) {
-        await db.wordRecords.where({ word, dict }).delete()
+        await remoteWrite('wordRecords', () => db.wordRecords.where({ word, dict }).delete())
       }
       return
     }
 
     if (ev.op === 'DELETE') {
       const localId = await getLocalIdBySyncUid(ev.entity, ev.syncUid)
+      const entity = ev.entity
       if (localId !== undefined) {
-        await db[ev.entity].delete(localId)
+        await remoteWrite(entity, () => db[entity].delete(localId))
       }
       return
     }
 
     await upsertLocalRecord(ev.entity, ev.syncUid, ev.payload)
-  })
-
-  if (ev.serverSeq) {
-    await setLastServerSeq(ev.serverSeq)
-  }
+  })()
 }
 
 /**
  * Apply a cold-start or catch-up snapshot returned by sync.req.snapshot.{userId}.
  */
 export async function applySnapshot(snap: SnapshotResponse): Promise<void> {
-  await withRemoteGuard(async () => {
+  await (async () => {
     // Apply wordRecords first so chapterRecords can resolve wordSyncUids -> localId
     const ordered = [...snap.records].sort((a, b) => entityOrder(a.entity) - entityOrder(b.entity))
     for (const rec of ordered) {
-      if (rec.entity === 'config') {
-        applyRemoteConfig(rec.syncUid, rec.payload)
+      if (rec.deleted) {
+        if (rec.entity !== 'config') {
+          const localId = await getLocalIdBySyncUid(rec.entity, rec.syncUid)
+          const entity = rec.entity
+          if (localId !== undefined) await remoteWrite(entity, () => db[entity].delete(localId))
+        }
+      } else if (rec.entity === 'config') {
+        await applyRemoteConfig(rec.syncUid, rec.payload)
       } else {
         await upsertLocalRecord(rec.entity, rec.syncUid, rec.payload)
       }
     }
-  })
-  if (snap.latestServerSeq > 0) {
-    await setLastServerSeq(snap.latestServerSeq)
-  }
+  })()
 }
 
 function entityOrder(entity: SyncEntity): number {
@@ -329,9 +341,9 @@ async function upsertLocalRecord(
   if (entity === 'wordRecords') {
     const data = rawPayload as unknown as IWordRecord
     if (existingLocalId !== undefined) {
-      await db.wordRecords.update(existingLocalId, data)
+      await remoteWrite('wordRecords', () => db.wordRecords.update(existingLocalId, data))
     } else {
-      const newId = await db.wordRecords.add(data)
+      const newId = await remoteWrite('wordRecords', () => db.wordRecords.add(data))
       await bindIdMapping('wordRecords', newId, syncUid)
     }
     return
@@ -349,9 +361,9 @@ async function upsertLocalRecord(
     delete payload.wordSyncUids
     const data = { ...payload, wordRecordIds } as unknown as IChapterRecord
     if (existingLocalId !== undefined) {
-      await db.chapterRecords.update(existingLocalId, data)
+      await remoteWrite('chapterRecords', () => db.chapterRecords.update(existingLocalId, data))
     } else {
-      const newId = await db.chapterRecords.add(data)
+      const newId = await remoteWrite('chapterRecords', () => db.chapterRecords.add(data))
       await bindIdMapping('chapterRecords', newId, syncUid)
     }
     return
@@ -367,21 +379,36 @@ async function upsertLocalRecord(
         index: Math.max(current?.index ?? 0, incoming.index ?? 0),
         isFinished: Boolean(current?.isFinished || incoming.isFinished),
       }
-      await db.reviewRecords.put(merged)
+      await remoteWrite('reviewRecords', () => db.reviewRecords.put(merged))
     } else {
-      const newId = await db.reviewRecords.add({ ...incoming, id: undefined })
+      const newId = await remoteWrite('reviewRecords', () => db.reviewRecords.add({ ...incoming, id: undefined }))
       await bindIdMapping('reviewRecords', newId, syncUid)
     }
   }
 }
 
-function applyRemoteConfig(key: string, payload: Record<string, unknown>): void {
+async function applyRemoteConfig(key: string, payload: Record<string, unknown>): Promise<void> {
   if (!SYNCED_KEY_SET.has(key) || typeof window === 'undefined') return
-  const newValue = typeof payload.value === 'string' ? payload.value : JSON.stringify(payload.value)
+  let newValue = typeof payload.value === 'string' ? payload.value : JSON.stringify(payload.value)
+  if (key === 'reviewModeInfo') {
+    const info = JSON.parse(newValue) as ReviewModeConfig
+    if (info.reviewRecord) {
+      // Legacy settings may still contain a foreign ID. Never use it locally.
+      delete info.reviewRecord.id
+      if (info.reviewSyncUid) {
+        // The config can arrive before the corresponding record event.
+        await upsertLocalRecord('reviewRecords', info.reviewSyncUid, clonePlain(info.reviewRecord))
+        const localId = await getLocalIdBySyncUid('reviewRecords', info.reviewSyncUid)
+        if (localId !== undefined) info.reviewRecord = await db.reviewRecords.get(localId)
+      }
+    }
+    newValue = JSON.stringify(info)
+  }
   const oldValue = window.localStorage.getItem(key)
   if (oldValue === newValue) return
 
-  window.localStorage.setItem(key, newValue)
+  const setItem = setRemoteStorageItem ?? Storage.prototype.setItem
+  setItem.call(window.localStorage, key, newValue)
   // Notify same-tab Jotai atomWithStorage listeners without changing any store code
   window.dispatchEvent(
     new StorageEvent('storage', {

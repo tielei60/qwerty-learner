@@ -61,13 +61,15 @@ func (e *SyncEvent) Validate() error {
 // SnapshotRequest is sent via NATS Request-Reply on sync.req.snapshot.{userId}
 // when a new device initializes or an offline device falls behind the JetStream window.
 type SnapshotRequest struct {
-	UserID        string `json:"userId"`
-	DeviceID      string `json:"deviceId"`
-	AfterSeq      int64  `json:"afterSeq,omitempty"`
+	AfterRow int64  `json:"afterRow,omitempty"`
+	UserID   string `json:"userId"`
+	DeviceID string `json:"deviceId"`
+	AfterSeq int64  `json:"afterSeq,omitempty"`
 }
 
 // SnapshotRecord represents one active authoritative record in the shared database.
 type SnapshotRecord struct {
+	Deleted   bool            `json:"deleted,omitempty"`
 	Entity    string          `json:"entity"`
 	SyncUID   string          `json:"syncUid"`
 	Payload   json.RawMessage `json:"payload"`
@@ -77,6 +79,8 @@ type SnapshotRecord struct {
 
 // SnapshotResponse returns the authoritative state and the latest server sequence.
 type SnapshotResponse struct {
+	NextAfterRow    int64            `json:"nextAfterRow,omitempty"`
+	NextAfterSeq    int64            `json:"nextAfterSeq,omitempty"`
 	UserID          string           `json:"userId"`
 	LatestServerSeq int64            `json:"latestServerSeq"`
 	Records         []SnapshotRecord `json:"records"`

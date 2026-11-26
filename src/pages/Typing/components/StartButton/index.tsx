@@ -6,14 +6,19 @@ import { useAtomValue } from 'jotai'
 import { useCallback, useContext, useState } from 'react'
 import { useHotkeys } from 'react-hotkeys-hook'
 
-export default function StartButton({ isLoading }: { isLoading: boolean }) {
+export default function StartButton({ isLoading, onResume }: { isLoading: boolean; onResume?: () => void }) {
   // eslint-disable-next-line  @typescript-eslint/no-non-null-assertion
   const { state, dispatch } = useContext(TypingContext)!
   const randomConfig = useAtomValue(randomConfigAtom)
 
   const onToggleIsTyping = useCallback(() => {
-    !isLoading && dispatch({ type: TypingStateActionType.TOGGLE_IS_TYPING })
-  }, [isLoading, dispatch])
+    if (isLoading) return
+    if (!state.isTyping && !state.isFinished && onResume) {
+      onResume()
+      return
+    }
+    dispatch({ type: TypingStateActionType.TOGGLE_IS_TYPING })
+  }, [isLoading, dispatch, onResume, state.isTyping, state.isFinished])
 
   const onClickRestart = useCallback(() => {
     dispatch({ type: TypingStateActionType.REPEAT_CHAPTER, shouldShuffle: randomConfig.isOpen })

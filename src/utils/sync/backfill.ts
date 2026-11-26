@@ -1,5 +1,5 @@
-import { SYNCED_STORAGE_KEYS } from './hooks'
-import { bindIdMapping, enqueueOutbox, getOrCreateDeviceId, getSyncUidByLocalId, syncMetaDb } from './metaDb'
+import { SYNCED_STORAGE_KEYS, serializeConfigValue } from './hooks'
+import { bindHistoricalId, enqueueOutbox, getOrCreateDeviceId, getSyncUidByLocalId, syncMetaDb } from './metaDb'
 import type { SyncEvent } from './types'
 import { db } from '@/utils/db'
 import type { IChapterRecord, IReviewRecord, IWordRecord } from '@/utils/db/record'
@@ -72,8 +72,7 @@ export async function scanAndEnqueueHistoricalData(userId: string): Promise<Back
     const existingUid = await getSyncUidByLocalId('wordRecords', localId)
     if (existingUid) continue
 
-    const syncUid = fingerprintWord(record)
-    await bindIdMapping('wordRecords', localId, syncUid)
+    const syncUid = await bindHistoricalId('wordRecords', localId, fingerprintWord(record))
 
     const payload = JSON.parse(JSON.stringify(record)) as Record<string, unknown>
     delete payload.id
@@ -93,10 +92,7 @@ export async function scanAndEnqueueHistoricalData(userId: string): Promise<Back
   }
 
   // 2. chapterRecords
-  const [chapterKeys, chapterRows] = await Promise.all([
-    db.chapterRecords.toCollection().primaryKeys(),
-    db.chapterRecords.toArray(),
-  ])
+  const [chapterKeys, chapterRows] = await Promise.all([db.chapterRecords.toCollection().primaryKeys(), db.chapterRecords.toArray()])
   for (let i = 0; i < chapterRows.length; i++) {
     const record = chapterRows[i]
     const localId = Number(chapterKeys[i])
@@ -104,8 +100,7 @@ export async function scanAndEnqueueHistoricalData(userId: string): Promise<Back
     const existingUid = await getSyncUidByLocalId('chapterRecords', localId)
     if (existingUid) continue
 
-    const syncUid = fingerprintChapter(record)
-    await bindIdMapping('chapterRecords', localId, syncUid)
+    const syncUid = await bindHistoricalId('chapterRecords', localId, fingerprintChapter(record))
 
     const wordSyncUids: string[] = []
     for (const wid of record.wordRecordIds ?? []) {
@@ -133,10 +128,7 @@ export async function scanAndEnqueueHistoricalData(userId: string): Promise<Back
   }
 
   // 3. reviewRecords
-  const [reviewKeys, reviewRows] = await Promise.all([
-    db.reviewRecords.toCollection().primaryKeys(),
-    db.reviewRecords.toArray(),
-  ])
+  const [reviewKeys, reviewRows] = await Promise.all([db.reviewRecords.toCollection().primaryKeys(), db.reviewRecords.toArray()])
   for (let i = 0; i < reviewRows.length; i++) {
     const record = reviewRows[i]
     const localId = Number(reviewKeys[i])
@@ -144,8 +136,7 @@ export async function scanAndEnqueueHistoricalData(userId: string): Promise<Back
     const existingUid = await getSyncUidByLocalId('reviewRecords', localId)
     if (existingUid) continue
 
-    const syncUid = fingerprintReview(record)
-    await bindIdMapping('reviewRecords', localId, syncUid)
+    const syncUid = await bindHistoricalId('reviewRecords', localId, fingerprintReview(record))
 
     const payload = JSON.parse(JSON.stringify(record)) as Record<string, unknown>
     delete payload.id
@@ -169,8 +160,9 @@ export async function scanAndEnqueueHistoricalData(userId: string): Promise<Back
   if (!alreadyBackfilled && typeof window !== 'undefined' && window.localStorage) {
     const now = Date.now()
     for (const key of SYNCED_STORAGE_KEYS) {
-      const value = window.localStorage.getItem(key)
-      if (value === null) continue
+      const localValue = window.localStorage.getItem(key)
+      if (localValue === null) continue
+      const value = await serializeConfigValue(key, localValue)
       scanned += 1
       const event: SyncEvent = {
         eventId: `backfill:${userId}:config:${key}:${deterministicHash(value)}`,

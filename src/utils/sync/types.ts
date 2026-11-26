@@ -18,9 +18,11 @@ export interface SnapshotRequest {
   userId: string
   deviceId: string
   afterSeq?: number
+  afterRow?: number
 }
 
 export interface SnapshotRecord {
+  deleted?: boolean
   entity: SyncEntity
   syncUid: string
   payload: Record<string, unknown>
@@ -29,14 +31,19 @@ export interface SnapshotRecord {
 }
 
 export interface SnapshotResponse {
+  nextAfterSeq?: number
+  nextAfterRow?: number
   userId: string
   latestServerSeq: number
   records: SnapshotRecord[]
 }
 
-export interface SyncConfig {
-  enabled: boolean
+export interface SyncScope {
   wsUrl: string
-  token: string
   userId: string
+}
+
+export interface SyncConfig extends SyncScope {
+  enabled: boolean
+  token: string
 }

@@ -1,7 +1,7 @@
 import type { BackfillResult } from './backfill'
 import { hasCompletedInitialBackfill, scanAndEnqueueHistoricalData } from './backfill'
 import { applyRemoteEvent, applySnapshot, registerLocalSyncHooks } from './hooks'
-import { getLastServerSeq, getOrCreateDeviceId, listOutbox, removeOutboxByEventId } from './metaDb'
+import { getLastServerSeq, getOrCreateDeviceId, listOutbox, removeOutboxByEventId, resetLastServerSeq, setLastServerSeq } from './metaDb'
 import { NatsWsClient } from './natsWsClient'
 import type { SnapshotRequest, SnapshotResponse, SyncConfig, SyncEvent } from './types'
 
@@ -23,6 +23,14 @@ let client: NatsWsClient | null = null
 let activeConfig: SyncConfig | null = null
 let isFlushing = false
 let flushRequested = false
+let inbound = Promise.resolve()
+
+function serializeInbound(work: () => Promise<void>): Promise<void> {
+  const result = inbound.then(work)
+  inbound = result.catch((err) => console.error('[sync] failed to apply inbound changes:', err))
+  return result
+}
+
 let unsubDown: (() => void) | null = null
 const statusListeners = new Set<StatusListener>()
 
@@ -34,9 +42,7 @@ export function loadSyncConfig(): SyncConfig {
       if (parsed.wsUrl || parsed.userId || parsed.token) {
         return {
           enabled: parsed.enabled !== false,
-          wsUrl: /^ws:\/\/(127\.0\.0\.1|localhost|\[::1\]):9222\/?$/.test(parsed.wsUrl ?? '')
-            ? 'ws://127.0.0.1:9322'
-            : parsed.wsUrl ?? '',
+          wsUrl: /^ws:\/\/(127\.0\.0\.1|localhost|\[::1\]):9222\/?$/.test(parsed.wsUrl ?? '') ? 'ws://127.0.0.1:9322' : parsed.wsUrl ?? '',
           token: parsed.token ?? '',
           userId: parsed.userId ?? '',
         }
@@ -65,7 +71,7 @@ export function saveSyncConfig(cfg: SyncConfig): void {
 
 export async function getSyncStatus(): Promise<SyncStatusSnapshot> {
   const cfg = activeConfig ?? loadSyncConfig()
-  const [deviceId, lastServerSeq, pending] = await Promise.all([getOrCreateDeviceId(), getLastServerSeq(), listOutbox()])
+  const [deviceId, lastServerSeq, pending] = await Promise.all([getOrCreateDeviceId(), getLastServerSeq(cfg), listOutbox()])
   return {
     enabled: Boolean(cfg.enabled && cfg.wsUrl && cfg.userId),
     connected: client?.isConnected() ?? false,
@@ -99,11 +105,18 @@ async function flushOutbox(): Promise<void> {
   flushRequested = false
   isFlushing = true
   try {
+    const connection = client
     const pending = await listOutbox()
     for (const row of pending) {
       const subject = `sync.up.${row.event.userId}`
-      const ok = client.publish(subject, JSON.stringify(row.event))
-      if (!ok) break
+      if (client !== connection) break
+      try {
+        const ack = JSON.parse(decoder.decode(await connection.request(subject, JSON.stringify(row.event))))
+        if (ack.stream !== 'SYNC_UP' || !ack.seq || ack.error) throw new Error('JetStream did not acknowledge the event')
+      } catch {
+        if (client === connection && connection.isConnected()) window.setTimeout(() => void flushOutbox(), 2000)
+        break
+      }
       await removeOutboxByEventId(row.eventId)
     }
   } finally {
@@ -115,20 +128,48 @@ async function flushOutbox(): Promise<void> {
 
 async function pullCatchUpSnapshot(): Promise<void> {
   if (!client || !client.isConnected() || !activeConfig) return
+  const cfg = activeConfig
+  const connection = client
   const deviceId = await getOrCreateDeviceId()
-  // Older builds can advance the shared cursor without knowing this preference.
-  const afterSeq = localStorage.getItem('unfinishedPractice') === null ? 0 : await getLastServerSeq()
+  // Replay once to recover deletions omitted by older snapshot responses.
+  const migrationKey = `qwerty_sync_tombstones:${cfg.wsUrl}:${cfg.userId}`
+  const afterSeq = localStorage.getItem(migrationKey) ? await getLastServerSeq(cfg) : 0
+  if (client !== connection) return
   const req: SnapshotRequest = {
-    userId: activeConfig.userId,
+    userId: cfg.userId,
     deviceId,
     afterSeq,
   }
   try {
-    const raw = await client.request(`sync.req.snapshot.${activeConfig.userId}`, JSON.stringify(req))
-    const snap = JSON.parse(decoder.decode(raw)) as SnapshotResponse
-    if (snap && Array.isArray(snap.records) && snap.records.length > 0) {
-      await applySnapshot(snap)
+    const records = new Map<string, SnapshotResponse['records'][number]>()
+    const subject = `sync.req.snapshot.${req.userId}`
+    let latestServerSeq: number
+    for (;;) {
+      const raw = await connection.request(subject, JSON.stringify(req))
+      if (client !== connection) return
+      const snap = JSON.parse(decoder.decode(raw)) as SnapshotResponse
+      if ((req.afterSeq ?? 0) > snap.latestServerSeq) {
+        // The server database was recreated; replay its new sequence from zero.
+        await resetLastServerSeq(cfg)
+        records.clear()
+        req.afterSeq = 0
+        delete req.afterRow
+        continue
+      }
+      for (const record of snap.records) records.set(JSON.stringify([record.entity, record.syncUid]), record)
+      latestServerSeq = snap.latestServerSeq
+      if (!snap.nextAfterSeq) break
+      if (
+        snap.nextAfterSeq < (req.afterSeq ?? 0) ||
+        (snap.nextAfterSeq === req.afterSeq && (snap.nextAfterRow ?? 0) <= (req.afterRow ?? 0))
+      )
+        throw new Error('Invalid snapshot cursor')
+      req.afterSeq = snap.nextAfterSeq
+      req.afterRow = snap.nextAfterRow
     }
+    await applySnapshot({ userId: req.userId, latestServerSeq, records: Array.from(records.values()) })
+    await setLastServerSeq(cfg, latestServerSeq)
+    localStorage.setItem(migrationKey, '1')
   } catch (err) {
     console.warn('[sync] catch-up snapshot skipped:', err)
   } finally {
@@ -151,13 +192,16 @@ function startClient(cfg: SyncConfig): void {
     onConnected: () => {
       notifyStatusListeners()
       void (async () => {
-        await pullCatchUpSnapshot()
-        if (activeConfig && !(await hasCompletedInitialBackfill(activeConfig.userId))) {
-          await scanAndEnqueueHistoricalData(activeConfig.userId)
-          notifyStatusListeners()
-        }
+        await serializeInbound(async () => {
+          if (activeConfig !== cfg) return
+          if (!(await hasCompletedInitialBackfill(cfg.userId))) {
+            await scanAndEnqueueHistoricalData(cfg.userId)
+            notifyStatusListeners()
+          }
+          await pullCatchUpSnapshot()
+        })
         await flushOutbox()
-      })()
+      })().catch((err) => console.error('[sync] startup sync failed:', err))
     },
     onDisconnected: () => {
       notifyStatusListeners()
@@ -167,7 +211,13 @@ function startClient(cfg: SyncConfig): void {
   unsubDown = client.subscribe(`sync.down.${cfg.userId}`, (_subject, payload) => {
     try {
       const ev = JSON.parse(decoder.decode(payload)) as SyncEvent
-      void applyRemoteEvent(ev).finally(() => notifyStatusListeners())
+      void serializeInbound(async () => {
+        if (activeConfig === cfg && (!ev.serverSeq || ev.serverSeq > (await getLastServerSeq(cfg)))) {
+          await applyRemoteEvent(ev)
+          if (ev.serverSeq) await setLastServerSeq(cfg, ev.serverSeq)
+        }
+        notifyStatusListeners()
+      }).catch(() => undefined)
     } catch (err) {
       console.error('[sync] failed to handle downstream event:', err)
     }
@@ -200,7 +250,7 @@ export function applySyncConfig(cfg: SyncConfig): void {
 }
 
 export async function triggerManualSync(): Promise<void> {
-  await pullCatchUpSnapshot()
+  await serializeInbound(pullCatchUpSnapshot)
   await flushOutbox()
 }
 

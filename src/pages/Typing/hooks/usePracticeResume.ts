@@ -48,9 +48,10 @@ export function usePracticeResume({
   selectChapter: (dict: string, chapter: number) => void
 }) {
   const [available, setAvailable] = useState(readCheckpoint)
-  const [requested, setRequested] = useState<Checkpoint | null>(null)
+  const [requested, setRequested] = useState<{ checkpoint: Checkpoint; start: boolean } | null>(null)
   const saved = useRef({ key: '', count: 0, index: 0, finished: false })
   const generation = useRef(0)
+  const restartVersion = useRef(state.practiceRestartVersion ?? 0)
   const key = JSON.stringify([dict, chapter])
 
   useEffect(() => {
@@ -63,6 +64,16 @@ export function usePracticeResume({
 
   useEffect(() => {
     if (review || state.practiceKey !== key) return
+    const restarted = (state.practiceRestartVersion ?? 0) > restartVersion.current
+    restartVersion.current = state.practiceRestartVersion ?? 0
+    if (restarted) {
+      ++generation.current
+      saved.current = { key, count: 0, index: 0, finished: false }
+      storeCheckpoint({ dict, chapter, progress: null })
+      setAvailable(null)
+      setRequested(null)
+      return
+    }
     const count = state.chapterData.wordCount
     const { index } = state.chapterData
     const previous = saved.current
@@ -80,6 +91,11 @@ export function usePracticeResume({
       return
     }
     if (!count) return
+    const stored = readCheckpoint()
+    if (stored?.dict === dict && stored.chapter === chapter && stored.progress && stored.progress.chapterData.index > index) {
+      setAvailable(stored)
+      return
+    }
 
     const { words: orderedWords, wordRecordIds, ...chapterData } = state.chapterData
     const { time } = state.timerData
@@ -107,8 +123,9 @@ export function usePracticeResume({
   }, [state, key, review, dict, chapter])
 
   useEffect(() => {
-    const progress = requested?.progress
-    if (!progress || review || requested.dict !== dict || requested.chapter !== chapter || state.practiceKey !== key || !words.length)
+    const checkpoint = requested?.checkpoint
+    const progress = checkpoint?.progress
+    if (!progress || review || checkpoint.dict !== dict || checkpoint.chapter !== chapter || state.practiceKey !== key || !words.length)
       return
     const byIndex = new Map(words.map((word) => [word.index, word]))
     const orderedWords = progress.order.map(([index, name]) => {
@@ -136,6 +153,7 @@ export function usePracticeResume({
             timerData: progress.timerData,
           },
         })
+        if (requested?.start) dispatch({ type: TypingStateActionType.SET_IS_TYPING, payload: true })
         setRequested(null)
         setAvailable(null)
       })
@@ -146,9 +164,12 @@ export function usePracticeResume({
   }, [requested, review, dict, chapter, key, state.practiceKey, words, dispatch])
 
   return available?.progress && !requested
-    ? () => {
-        setRequested(available)
-        selectChapter(available.dict, available.chapter)
+    ? {
+        matchesCurrent: !review && available.dict === dict && available.chapter === chapter,
+        start: (start = false) => {
+          setRequested({ checkpoint: available, start })
+          selectChapter(available.dict, available.chapter)
+        },
       }
     : null
 }

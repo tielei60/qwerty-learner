@@ -1,6 +1,6 @@
 {
   "build": {
-    "beforeBuildCommand": "yarn build",
+    "beforeBuildCommand": "bash scripts/build-desktop-assets.sh",
     "beforeDevCommand": "yarn run dev",
     "devPath": "http://localhost:3000",
     "distDir": "../build"
@@ -20,7 +20,7 @@
       "deb": {
         "depends": []
       },
-      "externalBin": [],
+      "externalBin": ["binaries/sync-server"],
       "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
       "identifier": "com.litongjava.qwerty.learner",
       "longDescription": "",
