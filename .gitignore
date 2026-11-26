@@ -34,3 +34,6 @@ stats.html
 /blob-report/
 /playwright/.cache/
 playwright-report
+/sync-server/data/
+/sync-server/sync-server
+/.run/

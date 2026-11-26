@@ -5,6 +5,7 @@ import { FriendLinks } from './pages/FriendLinks'
 import MobilePage from './pages/Mobile'
 import TypingPage from './pages/Typing'
 import { isOpenDarkModeAtom } from '@/store'
+import { initSyncEngine } from '@/utils/sync'
 import { Analytics } from '@vercel/analytics/react'
 import 'animate.css'
 import { useAtomValue } from 'jotai'
@@ -25,6 +26,8 @@ if (process.env.NODE_ENV === 'production') {
   // for dev
   mixpanel.init('5474177127e4767124c123b2d7846e2a', { debug: true })
 }
+
+initSyncEngine()
 
 function Root() {
   const darkMode = useAtomValue(isOpenDarkModeAtom)

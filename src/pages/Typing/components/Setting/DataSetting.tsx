@@ -1,4 +1,5 @@
 import SettingScroll from './SettingScroll'
+import SyncSettingSection from './SyncSettingSection'
 import styles from './index.module.css'
 import type { ExportProgress, ImportProgress } from '@/utils/db/data-export'
 import { exportDatabase, importDatabase } from '@/utils/db/data-export'
@@ -56,6 +57,7 @@ export default function DataSetting() {
   return (
     <SettingScroll>
       <div className={styles.tabContent}>
+        <SyncSettingSection />
         <div className={styles.section}>
           <span className={styles.sectionLabel}>数据导出</span>
           <span className={styles.sectionDescription}>

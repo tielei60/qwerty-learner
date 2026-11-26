@@ -58,8 +58,11 @@
     "xlsx": "^0.18.5"
   },
   "scripts": {
-    "dev": "vite",
-    "start": "vite",
+    "dev": "bash scripts/ensure-sync-server.sh && vite",
+    "dev:web-only": "vite",
+    "start": "bash scripts/ensure-sync-server.sh && vite",
+    "sync:build": "cd sync-server && go mod tidy && CGO_ENABLED=0 go build -ldflags=\"-s -w\" -o sync-server ./cmd/sync-server",
+    "sync:start": "bash scripts/ensure-sync-server.sh",
     "build": "cross-env CI=false vite build --base=./",
     "test": "echo \"No tests\"",
     "test:e2e": "playwright test",

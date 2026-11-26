@@ -37,6 +37,7 @@ export const initialUserInputLog: UserInputLog = {
 }
 
 export enum TypingStateActionType {
+  RESTORE_PRACTICE = 'RESTORE_PRACTICE',
   SETUP_CHAPTER = 'SETUP_CHAPTER',
   SET_IS_SKIP = 'SET_IS_SKIP',
   SET_IS_TYPING = 'SET_IS_TYPING',
@@ -62,7 +63,11 @@ export enum TypingStateActionType {
 }
 
 export type TypingStateAction =
-  | { type: TypingStateActionType.SETUP_CHAPTER; payload: { words: WordWithIndex[]; shouldShuffle: boolean; initialIndex?: number } }
+  | {
+      type: TypingStateActionType.SETUP_CHAPTER
+      payload: { words: WordWithIndex[]; shouldShuffle: boolean; initialIndex?: number; practiceKey?: string }
+    }
+  | { type: TypingStateActionType.RESTORE_PRACTICE; payload: Pick<TypingState, 'chapterData' | 'timerData'> }
   | { type: TypingStateActionType.SET_IS_SKIP; payload: boolean }
   | { type: TypingStateActionType.SET_IS_TYPING; payload: boolean }
   | { type: TypingStateActionType.TOGGLE_IS_TYPING }
@@ -93,6 +98,7 @@ export const typingReducer = (state: TypingState, action: TypingStateAction) => 
   switch (action.type) {
     case TypingStateActionType.SETUP_CHAPTER: {
       const newState = structuredClone(initialState)
+      newState.practiceKey = action.payload.practiceKey
       const words = action.payload.shouldShuffle ? shuffle(action.payload.words) : action.payload.words
       let initialIndex = action.payload.initialIndex ?? 0
       if (initialIndex >= words.length) {
@@ -104,6 +110,14 @@ export const typingReducer = (state: TypingState, action: TypingStateAction) => 
 
       return newState
     }
+    case TypingStateActionType.RESTORE_PRACTICE:
+      return {
+        ...structuredClone(initialState),
+        ...action.payload,
+        practiceKey: state.practiceKey,
+        practiceRestoreVersion: (state.practiceRestoreVersion ?? 0) + 1,
+        isTransVisible: state.isTransVisible,
+      }
     case TypingStateActionType.SET_IS_SKIP:
       state.isShowSkip = action.payload
       break
@@ -172,6 +186,7 @@ export const typingReducer = (state: TypingState, action: TypingStateAction) => 
     }
     case TypingStateActionType.REPEAT_CHAPTER: {
       const newState = structuredClone(initialState)
+      newState.practiceKey = state.practiceKey
       newState.chapterData.userInputLogs = state.chapterData.words.map((_, index) => ({ ...structuredClone(initialUserInputLog), index }))
       newState.isTyping = true
       newState.chapterData.words = action.shouldShuffle ? shuffle(state.chapterData.words) : state.chapterData.words

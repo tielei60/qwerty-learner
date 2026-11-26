@@ -3,36 +3,71 @@ import AdvancedSetting from './AdvancedSetting'
 import DataSetting from './DataSetting'
 import SoundSetting from './SoundSetting'
 import ViewSetting from '@/pages/Typing/components/Setting/ViewSetting'
+import type { SyncStatusSnapshot } from '@/utils/sync'
+import { subscribeSyncStatus } from '@/utils/sync'
 import { Dialog, Tab, Transition } from '@headlessui/react'
 import classNames from 'classnames'
-import { Fragment, useContext, useState } from 'react'
+import { Fragment, useContext, useEffect, useState } from 'react'
 import IconCog6Tooth from '~icons/heroicons/cog-6-tooth-solid'
 import IconEye from '~icons/heroicons/eye-solid'
 import IconAdjustmentsHorizontal from '~icons/tabler/adjustments-horizontal'
+import IconCloud from '~icons/tabler/cloud'
+import IconCloudOff from '~icons/tabler/cloud-off'
 import IconDatabaseCog from '~icons/tabler/database-cog'
 import IconEar from '~icons/tabler/ear'
 import IconX from '~icons/tabler/x'
 
 export default function Setting() {
   const [isOpen, setIsOpen] = useState(false)
+  const [selectedTab, setSelectedTab] = useState(0)
+  const [syncStatus, setSyncStatus] = useState<SyncStatusSnapshot | null>(null)
   const { dispatch } = useContext(TypingContext) ?? {}
+
+  useEffect(() => {
+    return subscribeSyncStatus(setSyncStatus)
+  }, [])
 
   function closeModal() {
     setIsOpen(false)
   }
 
-  function openModal() {
+  function openModal(tabIndex = 0) {
+    setSelectedTab(tabIndex)
     setIsOpen(true)
     if (dispatch) {
       dispatch({ type: TypingStateActionType.SET_IS_TYPING, payload: false })
     }
   }
 
+  const syncDotClass = !syncStatus?.connected
+    ? 'bg-rose-500'
+    : syncStatus.pendingOutbox > 0
+    ? 'bg-amber-400'
+    : 'bg-emerald-500'
+
+  const syncTitle = !syncStatus?.connected
+    ? `多端同步未连接${syncStatus && syncStatus.pendingOutbox > 0 ? `（待同步 ${syncStatus.pendingOutbox} 条）` : ''}`
+    : syncStatus.pendingOutbox > 0
+    ? `多端同步中（待同步 ${syncStatus.pendingOutbox} 条）`
+    : `多端已同步（seq ${syncStatus.lastServerSeq}）`
+
   return (
-    <>
+    <div className="flex items-center gap-2">
+      {syncStatus?.enabled && (
+        <button
+          type="button"
+          onClick={() => openModal(3)}
+          className="relative flex items-center justify-center rounded p-[2px] text-lg text-indigo-500 outline-none transition-colors duration-300 ease-in-out hover:bg-indigo-400 hover:text-white"
+          title={syncTitle}
+          aria-label={syncTitle}
+        >
+          {syncStatus.connected ? <IconCloud className="icon" /> : <IconCloudOff className="icon text-gray-400" />}
+          <span className={`absolute right-0 top-0 h-2 w-2 rounded-full ring-1 ring-white dark:ring-gray-800 ${syncDotClass}`} />
+        </button>
+      )}
       <button
         type="button"
-        onClick={openModal}
+        onClick={() => openModal(0)}
         className={`flex items-center justify-center rounded p-[2px] text-lg text-indigo-500 outline-none transition-colors duration-300 ease-in-out hover:bg-indigo-400 hover:text-white  ${
           isOpen && 'bg-indigo-500 text-white'
         }`}
@@ -74,7 +109,7 @@ export default function Setting() {
                     </button>
                   </div>
 
-                  <Tab.Group vertical>
+                  <Tab.Group vertical selectedIndex={selectedTab} onChange={setSelectedTab}>
                     <div className="flex h-120 min-h-0 w-full">
                       <Tab.List className="flex h-full w-52 shrink-0 flex-col items-start space-y-3 border-r border-neutral-100 bg-stone-50 px-6 py-3 dark:border-transparent dark:bg-gray-900">
                         <Tab
@@ -145,6 +180,6 @@ export default function Setting() {
           </div>
         </Dialog>
       </Transition>
-    </>
+    </div>
   )
 }

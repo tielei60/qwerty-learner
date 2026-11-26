@@ -8,6 +8,7 @@ import Switcher from './components/Switcher'
 import WordList from './components/WordList'
 import WordPanel from './components/WordPanel'
 import { useConfetti } from './hooks/useConfetti'
+import { usePracticeResume } from './hooks/usePracticeResume'
 import { useWordList } from './hooks/useWordList'
 import { TypingContext, TypingStateActionType, initialState, typingReducer } from './store'
 import { DonateCard } from '@/components/DonateCard'
@@ -29,13 +30,28 @@ const App: React.FC = () => {
   const { words } = useWordList()
 
   const [currentDictId, setCurrentDictId] = useAtom(currentDictIdAtom)
-  const setCurrentChapter = useSetAtom(currentChapterAtom)
+  const [currentChapter, setCurrentChapter] = useAtom(currentChapterAtom)
+  const setReviewModeInfo = useSetAtom(reviewModeInfoAtom)
   const randomConfig = useAtomValue(randomConfigAtom)
   const chapterLogUploader = useMixPanelChapterLogUploader(state)
   const saveChapterRecord = useSaveChapterRecord()
 
   const reviewModeInfo = useAtomValue(reviewModeInfoAtom)
   const isReviewMode = useAtomValue(isReviewModeAtom)
+  const practiceKey = isReviewMode ? undefined : JSON.stringify([currentDictId, currentChapter])
+  const resumePractice = usePracticeResume({
+    state,
+    dispatch,
+    dict: currentDictId,
+    chapter: currentChapter,
+    words,
+    review: isReviewMode,
+    selectChapter: (dict, chapter) => {
+      if (isReviewMode) setReviewModeInfo({ isReviewMode: false, reviewRecord: undefined })
+      setCurrentDictId(dict)
+      setCurrentChapter(chapter)
+    },
+  })
 
   useEffect(() => {
     // 检测用户设备
@@ -98,11 +114,11 @@ const App: React.FC = () => {
 
       dispatch({
         type: TypingStateActionType.SETUP_CHAPTER,
-        payload: { words, shouldShuffle: randomConfig.isOpen, initialIndex },
+        payload: { words, shouldShuffle: randomConfig.isOpen, initialIndex, practiceKey },
       })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [words])
+  }, [words, practiceKey])
 
   useEffect(() => {
     // 当用户完成章节后且完成 word Record 数据保存，记录 chapter Record 数据,
@@ -137,6 +153,11 @@ const App: React.FC = () => {
           <PronunciationSwitcher />
           <Switcher />
           <StartButton isLoading={isLoading} />
+          {resumePractice && !state.isTyping && (
+            <button type="button" className="my-btn-primary" onClick={resumePractice}>
+              继续上次练习
+            </button>
+          )}
           <Tooltip content="跳过该词">
             <button
               className={`${
@@ -159,7 +180,7 @@ const App: React.FC = () => {
                   ></div>
                 </div>
               ) : (
-                !state.isFinished && <WordPanel />
+                !state.isFinished && <WordPanel key={state.practiceRestoreVersion} />
               )}
             </div>
             <Speed />
